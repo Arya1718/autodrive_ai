@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 
 from adaptive_ai import AdaptiveDirector
 from rl_agent import RLAgent
-from simulation_core import SimulationConfig, run_episode, train_agent, train_until_goal, train_coevolution
+from simulation_core import SimulationConfig, run_episode, train_agent, train_until_goal, train_coevolution, adapt_config_for_episode
 from ui_components import inject_theme, render_hero, render_config_summary, render_metrics, render_episode_card
 
 load_dotenv()
@@ -48,6 +48,8 @@ STATE_DEFAULTS = {
     "last_training_block": [],
     "standard_video_config": None,
     "groq_ready": bool(os.getenv("GROQ_API_KEY")),
+    "benchmark_df": pd.DataFrame(),
+    "benchmark_overall": pd.DataFrame(),
 }
 
 for key, value in STATE_DEFAULTS.items():
@@ -1068,6 +1070,122 @@ def summarize_runs(history: list[dict]) -> dict:
         "Accuracy %": accuracy,
     }
 
+
+def normalize_score(avg_score: float) -> float:
+    # Map a broad reward range to 0..100 for composite scoring.
+    return max(0.0, min(100.0, (avg_score + 100.0) / 3.0))
+
+
+def benchmark_metrics(history: list[dict], label: str) -> dict:
+    if not history:
+        return {
+            "Scenario": label,
+            "Episodes": 0,
+            "Success Rate %": 0.0,
+            "Crash Rate %": 0.0,
+            "Avg Score": 0.0,
+            "Score Std": 0.0,
+            "Avg Efficiency": 0.0,
+            "Avg Steps": 0.0,
+            "Avg Speed": 0.0,
+            "Consistency %": 0.0,
+            "Safety %": 0.0,
+            "Performance Index %": 0.0,
+        }
+
+    episodes = len(history)
+    success_rate = (sum(1 for ep in history if ep.get("reached_goal")) / episodes) * 100.0
+    crash_rate = (sum(1 for ep in history if ep.get("collision")) / episodes) * 100.0
+    scores = [float(ep.get("score", 0.0)) for ep in history]
+    avg_score = float(sum(scores) / episodes)
+    score_std = float(pd.Series(scores).std(ddof=0)) if episodes > 1 else 0.0
+    avg_eff = float(sum(float(ep.get("path_efficiency", 0.0)) for ep in history) / episodes)
+    avg_steps = float(sum(float(ep.get("steps", 0.0)) for ep in history) / episodes)
+    avg_speed = float(sum(float(ep.get("avg_speed", 0.0)) for ep in history) / episodes)
+
+    consistency = max(0.0, 100.0 - min(100.0, score_std * 2.0))
+    safety = max(0.0, 100.0 - crash_rate)
+    performance_index = (
+        0.35 * success_rate
+        + 0.25 * safety
+        + 0.20 * (avg_eff * 100.0)
+        + 0.20 * normalize_score(avg_score)
+    )
+
+    return {
+        "Scenario": label,
+        "Episodes": episodes,
+        "Success Rate %": round(success_rate, 2),
+        "Crash Rate %": round(crash_rate, 2),
+        "Avg Score": round(avg_score, 2),
+        "Score Std": round(score_std, 2),
+        "Avg Efficiency": round(avg_eff, 3),
+        "Avg Steps": round(avg_steps, 2),
+        "Avg Speed": round(avg_speed, 2),
+        "Consistency %": round(consistency, 2),
+        "Safety %": round(safety, 2),
+        "Performance Index %": round(performance_index, 2),
+    }
+
+
+def run_benchmark_suite(agent, base_cfg: SimulationConfig, episodes_per_scenario: int = 8) -> tuple[pd.DataFrame, pd.DataFrame]:
+    scenario_configs = [
+        ("Base Scenario", SimulationConfig(**asdict(base_cfg))),
+        (
+            "Rain Stress",
+            SimulationConfig(
+                **{
+                    **asdict(base_cfg),
+                    "weather": "rainy",
+                    "obstacle_count": min(18, int(base_cfg.obstacle_count) + 2),
+                }
+            ),
+        ),
+        (
+            "Fog Stress",
+            SimulationConfig(
+                **{
+                    **asdict(base_cfg),
+                    "weather": "foggy",
+                    "fog_alpha": max(0.2, float(base_cfg.fog_alpha)),
+                }
+            ),
+        ),
+        (
+            "Complex Track Stress",
+            SimulationConfig(
+                **{
+                    **asdict(base_cfg),
+                    "track_complexity": "complex",
+                    "obstacle_count": min(18, int(base_cfg.obstacle_count) + 3),
+                }
+            ),
+        ),
+    ]
+
+    rows = []
+    for label, scenario_cfg in scenario_configs:
+        history = [run_episode(agent, scenario_cfg, learn=False) for _ in range(episodes_per_scenario)]
+        rows.append(benchmark_metrics(history, label))
+
+    benchmark_df = pd.DataFrame(rows)
+
+    if benchmark_df.empty:
+        return benchmark_df, pd.DataFrame()
+
+    overall = pd.DataFrame(
+        [
+            {
+                "Benchmark Episodes": int(benchmark_df["Episodes"].sum()),
+                "Mean Success Rate %": round(float(benchmark_df["Success Rate %"].mean()), 2),
+                "Mean Crash Rate %": round(float(benchmark_df["Crash Rate %"].mean()), 2),
+                "Mean Efficiency": round(float(benchmark_df["Avg Efficiency"].mean()), 3),
+                "Mean Performance Index %": round(float(benchmark_df["Performance Index %"].mean()), 2),
+            }
+        ]
+    )
+    return benchmark_df, overall
+
 adaptive_director = AdaptiveDirector()
 
 with st.sidebar:
@@ -1112,8 +1230,34 @@ with tab_standard:
         run_eval = col_b.button("Evaluate Current Agent", width="stretch")
 
         if run_train:
-            history = train_until_goal(st.session_state.agent, cfg, max_episodes=30)
-            st.session_state.history_standard.extend(history)
+            progress_container = st.container()
+            table_placeholder = progress_container.empty()
+            message_placeholder = progress_container.empty()
+            
+            with message_placeholder.container():
+                st.info("🔄 Training in progress... Updating after each episode.")
+            
+            history = []
+            for episode_num in range(1, 31):
+                episode = run_episode(st.session_state.agent, cfg, learn=True)
+                if hasattr(st.session_state.agent, "adapt_after_episode"):
+                    st.session_state.agent.adapt_after_episode(episode)
+                history.append(episode)
+                st.session_state.history_standard.append(episode)
+                
+                # Update table after each episode
+                history_df = pd.DataFrame(history)
+                history_df["episode_index"] = range(1, len(history_df) + 1)
+                display_cols = ["episode_index", "score", "collision", "reached_goal", "path_efficiency", "avg_speed"]
+                with table_placeholder.container():
+                    st.dataframe(history_df[display_cols], width="stretch")
+                
+                if episode.get("reached_goal"):
+                    st.session_state.agent.decay()
+                    break
+            else:
+                st.session_state.agent.decay()
+            
             st.session_state.last_training_block = history
             latest = history[-1]
             st.session_state.last_episode = latest
@@ -1123,6 +1267,13 @@ with tab_standard:
             if latest["collision"]:
                 st.session_state.failure_text = adaptive_director.analyze_failure(latest)
             st.session_state.analysis_text = adaptive_director.summarize_training_block(history, adaptive=False)
+            
+            with message_placeholder.container():
+                if latest.get("reached_goal"):
+                    st.success("✅ RL training finished: destination reached!")
+                else:
+                    st.error("❌ RL training finished: max episodes reached without destination.")
+            
             st.rerun()
 
         if run_eval:
@@ -1179,24 +1330,86 @@ with tab_adaptive:
         evolve = st.button("Run Adaptive Loop", width="stretch")
 
         if evolve:
-            block, local_cfg, last_adaptation = train_coevolution(st.session_state.agent, cfg, episodes=12)
-            for episode in block:
+            progress_container = st.container()
+            table_placeholder = progress_container.empty()
+            message_placeholder = progress_container.empty()
+            
+            with message_placeholder.container():
+                st.info("🔄 Adaptive training in progress... Updating after each episode.")
+            
+            block = []
+            current_config = cfg
+            last_adaptation = None
+
+            for episode_num in range(1, 13):
+                prev_episode = block[-1] if block else None
+                episode = run_episode(st.session_state.agent, current_config, learn=True)
+                episode["prev_score"] = round(float(prev_episode.get("score", 0.0)), 2) if prev_episode else None
+                episode["prev_path_efficiency"] = round(float(prev_episode.get("path_efficiency", 0.0)), 3) if prev_episode else None
+                episode["prev_avg_speed"] = round(float(prev_episode.get("avg_speed", 0.0)), 2) if prev_episode else None
+                episode["prev_collision"] = bool(prev_episode.get("collision", False)) if prev_episode else None
+                episode["prev_reached_goal"] = bool(prev_episode.get("reached_goal", False)) if prev_episode else None
+                episode["prev_sensor_snapshot"] = prev_episode.get("sensor_snapshot") if prev_episode else None
+                if hasattr(st.session_state.agent, "adapt_after_episode"):
+                    st.session_state.agent.adapt_after_episode(episode)
+                next_config, adaptation = adapt_config_for_episode(current_config, episode)
+                episode["adaptation"] = adaptation
+                episode["next_config"] = adaptation["next_config"]
+                block.append(episode)
+                st.session_state.history_adaptive.append(episode)
+                last_adaptation = adaptation
+                
+                # Update adaptive-specific table after each episode
+                block_df = pd.DataFrame(block)
+                block_df["episode_index"] = range(1, len(block_df) + 1)
+                display_cols = [
+                    "episode_index",
+                    "score",
+                    "collision",
+                    "reached_goal",
+                    "path_efficiency",
+                    "difficulty",
+                    "prev_score",
+                    "prev_path_efficiency",
+                    "prev_avg_speed",
+                    "prev_collision",
+                    "prev_reached_goal",
+                    "prev_sensor_snapshot",
+                ]
+                with table_placeholder.container():
+                    st.dataframe(block_df[display_cols], width="stretch")
+                
+                # Update adaptive text with current adaptation analysis
                 if episode.get("adaptation"):
                     st.session_state.adaptive_text = episode["adaptation"]["analysis"]
                 st.session_state.sensor_text = adaptive_director.explain_sensor_state(episode["sensor_snapshot"], episode["avg_speed"])
                 if episode["collision"]:
                     st.session_state.failure_text = adaptive_director.analyze_failure(episode)
+                
                 if episode.get("reached_goal"):
+                    current_config = SimulationConfig(**episode["config"])
+                    st.session_state.agent.decay()
                     break
-            st.session_state.config = asdict(local_cfg)
-            st.session_state.history_adaptive.extend(block)
+                
+                current_config = next_config
+            else:
+                st.session_state.agent.decay()
+            
+            st.session_state.config = asdict(current_config)
             st.session_state.last_episode = block[-1]
             st.session_state.analysis_text = adaptive_director.summarize_training_block(block, adaptive=True)
-            if block[-1]["collision"]:
+            if block[-1].get("collision") and not block[-1].get("reached_goal"):
                 st.session_state.failure_text = adaptive_director.analyze_failure(block[-1])
             st.session_state.sensor_text = adaptive_director.explain_sensor_state(block[-1]["sensor_snapshot"], block[-1]["avg_speed"])
             if last_adaptation:
                 st.session_state.adaptive_text = last_adaptation["analysis"]
+            
+            with message_placeholder.container():
+                if block[-1].get("reached_goal"):
+                    st.success("✅ Adaptive training finished: destination reached!")
+                else:
+                    st.error("❌ Adaptive training finished: max episodes reached without destination.")
+            
             st.rerun()
 
         sim_html = build_simulation(st.session_state.config)
@@ -1216,6 +1429,23 @@ with tab_adaptive:
             fig2 = px.line(adf, x="episode_index", y=["score", "difficulty"], markers=True, template="plotly_dark")
             fig2.update_layout(height=300, margin=dict(l=20, r=20, t=20, b=20))
             st.plotly_chart(fig2, width="stretch")
+            st.markdown("### 📋 Adaptive Episode Log (With Previous Episode Readings)")
+            adaptive_table_cols = [
+                "episode_index",
+                "score",
+                "collision",
+                "reached_goal",
+                "path_efficiency",
+                "difficulty",
+                "prev_score",
+                "prev_path_efficiency",
+                "prev_avg_speed",
+                "prev_collision",
+                "prev_reached_goal",
+                "prev_sensor_snapshot",
+            ]
+            available_cols = [col for col in adaptive_table_cols if col in adf.columns]
+            st.dataframe(adf[available_cols].tail(12), width="stretch")
             render_episode_card(adf.iloc[-1].to_dict())
 
 st.markdown("## Standard vs Adaptive Comparison")
@@ -1239,3 +1469,51 @@ if comparison_df["Episodes"].sum() > 0:
     )
     metric_fig.update_layout(height=320, margin=dict(l=20, r=20, t=20, b=20))
     st.plotly_chart(metric_fig, width="stretch")
+
+st.markdown("## Benchmark & Performance Evaluation")
+bench_col1, bench_col2 = st.columns([0.8, 1.2], gap="large")
+
+with bench_col1:
+    bench_episodes = st.slider("Episodes per scenario", 3, 20, 8, 1)
+    run_benchmark = st.button("Run Benchmark Suite", width="stretch")
+    st.caption("Runs evaluation-only episodes across base and stress scenarios. The agent does not learn during benchmark runs.")
+
+    if run_benchmark:
+        with st.spinner("Running benchmark scenarios..."):
+            benchmark_df, overall_df = run_benchmark_suite(st.session_state.agent, cfg, episodes_per_scenario=bench_episodes)
+            st.session_state.benchmark_df = benchmark_df
+            st.session_state.benchmark_overall = overall_df
+
+with bench_col2:
+    benchmark_df = st.session_state.benchmark_df
+    overall_df = st.session_state.benchmark_overall
+
+    if isinstance(benchmark_df, pd.DataFrame) and not benchmark_df.empty:
+        st.markdown("### Scenario Results")
+        st.dataframe(benchmark_df, width="stretch")
+
+        score_fig = px.bar(
+            benchmark_df,
+            x="Scenario",
+            y=["Success Rate %", "Crash Rate %", "Performance Index %"],
+            barmode="group",
+            template="plotly_dark",
+        )
+        score_fig.update_layout(height=340, margin=dict(l=20, r=20, t=20, b=20))
+        st.plotly_chart(score_fig, width="stretch")
+
+        eff_fig = px.line(
+            benchmark_df,
+            x="Scenario",
+            y=["Avg Efficiency", "Consistency %", "Safety %"],
+            markers=True,
+            template="plotly_dark",
+        )
+        eff_fig.update_layout(height=320, margin=dict(l=20, r=20, t=20, b=20))
+        st.plotly_chart(eff_fig, width="stretch")
+
+        if isinstance(overall_df, pd.DataFrame) and not overall_df.empty:
+            st.markdown("### Overall Benchmark Summary")
+            st.dataframe(overall_df, width="stretch")
+    else:
+        st.info("Run the benchmark suite to evaluate your self-driving car across scenarios.")
