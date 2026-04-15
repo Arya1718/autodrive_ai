@@ -80,6 +80,9 @@ def render_metrics(df):
 
 def render_episode_card(ep: dict):
     st.markdown("### Latest Episode")
+    adaptation = ep.get('adaptation') or {}
+    next_cfg = adaptation.get('next_config') or ep.get('next_config') or {}
+    directional = ep.get('directional_snapshot') or {}
     st.markdown(
         f"""
         <div class="card">
@@ -89,6 +92,13 @@ def render_episode_card(ep: dict):
             <p><strong>Path efficiency:</strong> {ep.get('path_efficiency')}</p>
             <p><strong>Average speed:</strong> {ep.get('avg_speed')}</p>
             <p><strong>Difficulty:</strong> {ep.get('difficulty')}</p>
+            <p><strong>Goal angle:</strong> {directional.get('goal_angle', 'n/a')}</p>
+            <p><strong>Heading error:</strong> {directional.get('heading_error', 'n/a')}</p>
+            <p><strong>Turn bias:</strong> {directional.get('turn_bias', 'n/a')}</p>
+            <p><strong>Goal distance:</strong> {directional.get('goal_distance', 'n/a')}</p>
+            <p><strong>Next obstacles:</strong> {next_cfg.get('obstacle_count', 'n/a')}</p>
+            <p><strong>Next speed:</strong> {next_cfg.get('car_speed', 'n/a')}</p>
+            <p><strong>Adaptation:</strong> {adaptation.get('analysis', ep.get('adaptation_summary', 'n/a'))}</p>
         </div>
         """,
         unsafe_allow_html=True,

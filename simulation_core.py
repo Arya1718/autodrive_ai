@@ -22,6 +22,8 @@ class SimulationConfig:
 COMPLEXITY_FACTOR = {"simple": 0.85, "moderate": 1.0, "complex": 1.2}
 WEATHER_FACTOR = {"clear": 1.0, "rainy": 1.15, "foggy": 1.2}
 ACTIONS = [(-1, -0.2), (-1, 0.0), (-0.4, 0.1), (0.0, 0.2), (0.4, 0.1), (1.0, 0.0), (1.0, -0.2)]
+WEATHER_SEQUENCE = ["clear", "foggy", "rainy"]
+GOAL_RADIUS = 82
 
 
 def normalize_track_complexity(value: str) -> str:
@@ -37,6 +39,28 @@ def normalize_track_complexity(value: str) -> str:
     if normalized in {"simple", "moderate", "complex"}:
         return normalized
     return lookup.get(normalized, "moderate")
+
+
+def clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def angle_diff(target: float, current: float) -> float:
+    diff = target - current
+    while diff > math.pi:
+        diff -= 2 * math.pi
+    while diff < -math.pi:
+        diff += 2 * math.pi
+    return diff
+
+
+def shift_weather(weather: str, direction: int) -> str:
+    current = (weather or "clear").strip().lower()
+    if current not in WEATHER_SEQUENCE:
+        current = "clear"
+    index = WEATHER_SEQUENCE.index(current)
+    next_index = int(clamp(index + direction, 0, len(WEATHER_SEQUENCE) - 1))
+    return WEATHER_SEQUENCE[next_index]
 
 
 class Track:
@@ -79,11 +103,61 @@ class Track:
         return obstacles
 
 
-def state_key(sensors: List[float], speed_ratio: float, goal_angle: float) -> Tuple[int, ...]:
+def state_key(sensors: List[float], speed_ratio: float, goal_angle: float, heading_error: float, turn_bias: float, goal_distance: float) -> Tuple[int, ...]:
     sensor_bins = tuple(min(4, int(x * 5)) for x in sensors)
     speed_bin = min(4, int(speed_ratio * 5))
     angle_bin = min(6, max(0, int((goal_angle + math.pi) / (2 * math.pi) * 7)))
-    return sensor_bins + (speed_bin, angle_bin)
+    heading_bin = min(6, max(0, int((heading_error + math.pi) / (2 * math.pi) * 7)))
+    bias_bin = min(4, max(0, int((turn_bias + 1.0) * 2)))
+    distance_bin = min(6, int(min(goal_distance, 220.0) / 220.0 * 7))
+    return sensor_bins + (speed_bin, angle_bin, heading_bin, bias_bin, distance_bin)
+
+
+def directional_teacher_action(env: SimEnv, obs: Dict) -> int:
+    target = env.track.centerline[env.goal_index % len(env.track.centerline)]
+    destination = env.track.destination
+    weather_drag = WEATHER_FACTOR[env.cfg.weather]
+    front = obs["sensors"][3]
+    left_open = sum(obs["sensors"][:3]) / 3.0
+    right_open = sum(obs["sensors"][4:]) / 3.0
+
+    best_action = 0
+    best_score = float("inf")
+
+    for index, (steer, accel) in enumerate(ACTIONS):
+        next_angle = env.angle + steer * 0.09
+        next_speed = min(env.cfg.car_speed, max(0.4, env.speed + accel / weather_drag))
+        next_x = env.x + math.cos(next_angle) * next_speed * 3.0
+        next_y = env.y + math.sin(next_angle) * next_speed * 3.0
+
+        target_distance = math.hypot(next_x - target[0], next_y - target[1])
+        destination_distance = math.hypot(next_x - destination[0], next_y - destination[1])
+        target_angle = math.atan2(target[1] - next_y, target[0] - next_x)
+        alignment_error = abs(angle_diff(target_angle, next_angle))
+        road_penalty = 0.0 if env._is_on_track(next_x, next_y) else 30.0
+        obstacle_penalty = 0.0
+        for ox, oy, rad in env.track.obstacles:
+            if math.hypot(next_x - ox, next_y - oy) <= rad + 8:
+                obstacle_penalty = 45.0
+                break
+
+        open_side_bias = (right_open - left_open) * 2.0
+        sensor_bias = -8.0 if front < 0.3 else -2.0 if front < 0.5 else 0.0
+        score = (
+            target_distance * 0.65
+            + destination_distance * 0.08
+            + alignment_error * 12.0
+            + road_penalty
+            + obstacle_penalty
+            - open_side_bias
+            + sensor_bias
+        )
+
+        if score < best_score:
+            best_score = score
+            best_action = index
+
+    return best_action
 
 
 class SimEnv:
@@ -110,15 +184,19 @@ class SimEnv:
         sensors = self._sense()
         target = self.track.centerline[self.goal_index % len(self.track.centerline)]
         target_angle = math.atan2(target[1] - self.y, target[0] - self.x)
-        diff = target_angle - self.angle
-        while diff > math.pi:
-            diff -= 2 * math.pi
-        while diff < -math.pi:
-            diff += 2 * math.pi
+        diff = angle_diff(target_angle, self.angle)
+        destination_angle = math.atan2(self.track.destination[1] - self.y, self.track.destination[0] - self.x)
+        heading_error = angle_diff(destination_angle, self.angle)
+        left_bias = sum(sensors[:3]) / 3.0
+        right_bias = sum(sensors[4:]) / 3.0
+        turn_bias = right_bias - left_bias
         return {
             "sensors": sensors,
             "speed_ratio": min(1.0, self.speed / max(1.0, self.cfg.car_speed)),
             "goal_angle": diff,
+            "heading_error": heading_error,
+            "turn_bias": turn_bias,
+            "goal_distance": math.hypot(target[0] - self.x, target[1] - self.y),
         }
 
     def _sense(self) -> List[float]:
@@ -152,7 +230,7 @@ class SimEnv:
         self.step_count += 1
         self.path.append((self.x, self.y))
 
-        reward = -0.4
+        reward = -0.25
         if not self._is_on_track(self.x, self.y):
             reward -= 8
             self.collision = True
@@ -163,14 +241,25 @@ class SimEnv:
                 break
 
         target = self.track.centerline[self.goal_index % len(self.track.centerline)]
-        d = math.hypot(self.x - target[0], self.y - target[1])
-        reward += max(0, 6 - d * 0.05)
-        if d < 26:
+        target_angle = math.atan2(target[1] - self.y, target[0] - self.x)
+        goal_distance = math.hypot(self.x - target[0], self.y - target[1])
+        alignment_error = abs(angle_diff(target_angle, self.angle))
+        destination_angle = math.atan2(self.track.destination[1] - self.y, self.track.destination[0] - self.x)
+        heading_error = abs(angle_diff(destination_angle, self.angle))
+        left_bias = sum(self._sense()[:3]) / 3.0
+        right_bias = sum(self._sense()[4:]) / 3.0
+        turn_bias = right_bias - left_bias
+
+        reward += max(0, 4.5 - goal_distance * 0.04)
+        reward += max(0, 1.8 - alignment_error * 0.9)
+        reward += max(0, 1.0 - heading_error * 0.4)
+        reward += max(-0.4, min(0.4, turn_bias * 0.15))
+        if goal_distance < 26:
             self.goal_index += 1
             self.total_progress += 1
             reward += 10
 
-        if math.hypot(self.x - self.track.destination[0], self.y - self.track.destination[1]) < 34:
+        if math.hypot(self.x - self.track.destination[0], self.y - self.track.destination[1]) < GOAL_RADIUS:
             self.reached_goal = True
             reward += 60
 
@@ -186,6 +275,54 @@ class EpisodeStats(dict):
     pass
 
 
+def adapt_config_for_episode(config: SimulationConfig, episode: dict) -> tuple[SimulationConfig, dict]:
+    score = float(episode.get("score", 0.0))
+    efficiency = float(episode.get("path_efficiency", 0.0))
+    collision = bool(episode.get("collision", False))
+    reached_goal = bool(episode.get("reached_goal", False))
+    difficulty = float(episode.get("difficulty", 0.0))
+
+    next_cfg = asdict(config)
+    complexity_rank = ["simple", "moderate", "complex"]
+    complexity_index = complexity_rank.index(normalize_track_complexity(config.track_complexity))
+
+    if collision:
+        next_cfg["obstacle_count"] = max(3, int(next_cfg["obstacle_count"] - 1))
+        next_cfg["car_speed"] = round(clamp(next_cfg["car_speed"] - 0.18, 1.0, 4.5), 2)
+        next_cfg["track_complexity"] = complexity_rank[max(0, complexity_index - 1)]
+        next_cfg["weather"] = shift_weather(next_cfg["weather"], -1)
+        next_cfg["fog_alpha"] = round(clamp(float(next_cfg.get("fog_alpha", 0.0)) - 0.05, 0.0, 0.45), 2)
+        analysis = "The environment backed off after a collision, lowering pressure so the policy can recover and relearn control margins."
+    elif reached_goal or score > 45:
+        next_cfg["obstacle_count"] = min(18, int(next_cfg["obstacle_count"] + 1))
+        next_cfg["car_speed"] = round(clamp(next_cfg["car_speed"] + 0.12, 1.0, 4.5), 2)
+        if efficiency > 0.55 or reached_goal:
+            next_cfg["track_complexity"] = complexity_rank[min(2, complexity_index + 1)]
+        next_cfg["weather"] = shift_weather(next_cfg["weather"], 1 if efficiency > 0.45 else 0)
+        next_cfg["fog_alpha"] = round(clamp(float(next_cfg.get("fog_alpha", 0.0)) + (0.04 if next_cfg["weather"] == "foggy" else 0.0), 0.0, 0.45), 2)
+        analysis = "The environment sharpened the challenge because the agent handled the last episode cleanly and can absorb harder scenarios."
+    else:
+        if efficiency < 0.35:
+            next_cfg["car_speed"] = round(clamp(next_cfg["car_speed"] - 0.08, 1.0, 4.5), 2)
+            next_cfg["fog_alpha"] = round(clamp(float(next_cfg.get("fog_alpha", 0.0)) + 0.03, 0.0, 0.45), 2)
+            analysis = "The route stayed mostly steady, but the director softened the visibility and speed envelope slightly because the policy showed uncertainty."
+        else:
+            next_cfg["obstacle_count"] = max(3, min(18, int(next_cfg["obstacle_count"])))
+            analysis = "The environment held a near-neutral setting to keep the learning signal stable."
+
+    next_cfg["track_complexity"] = normalize_track_complexity(next_cfg["track_complexity"])
+    adaptation = {
+        "score": round(score, 2),
+        "difficulty": round(difficulty, 2),
+        "efficiency": round(efficiency, 3),
+        "collision": collision,
+        "reached_goal": reached_goal,
+        "analysis": analysis,
+        "next_config": next_cfg,
+    }
+    return SimulationConfig(**next_cfg), adaptation
+
+
 def run_episode(agent, config: SimulationConfig, learn: bool = True) -> EpisodeStats:
     env = SimEnv(config)
     obs = env.reset()
@@ -194,10 +331,13 @@ def run_episode(agent, config: SimulationConfig, learn: bool = True) -> EpisodeS
     last_sensors = obs["sensors"]
 
     for _ in range(env.max_steps):
-        state = state_key(obs["sensors"], obs["speed_ratio"], obs["goal_angle"])
-        action = agent.choose_action(state, explore=learn)
+        state = state_key(obs["sensors"], obs["speed_ratio"], obs["goal_angle"], obs["heading_error"], obs["turn_bias"], obs["goal_distance"])
+        guidance = directional_teacher_action(env, obs) if learn else None
+        action = agent.choose_action(state, explore=learn, preferred_action=guidance)
         next_obs, reward, done, info = env.step(action)
-        next_state = state_key(next_obs["sensors"], next_obs["speed_ratio"], next_obs["goal_angle"])
+        if learn and info.get("collision") and not info.get("reached_goal"):
+            done = False
+        next_state = state_key(next_obs["sensors"], next_obs["speed_ratio"], next_obs["goal_angle"], next_obs["heading_error"], next_obs["turn_bias"], next_obs["goal_distance"])
         if learn:
             agent.learn(state, action, reward, next_state, done)
         obs = next_obs
@@ -222,6 +362,12 @@ def run_episode(agent, config: SimulationConfig, learn: bool = True) -> EpisodeS
         steps=env.step_count,
         sensor_snapshot=[round(x, 3) for x in last_sensors],
         difficulty=difficulty,
+        directional_snapshot={
+            "goal_angle": round(float(obs["goal_angle"]), 3),
+            "heading_error": round(float(obs["heading_error"]), 3),
+            "turn_bias": round(float(obs["turn_bias"]), 3),
+            "goal_distance": round(float(obs["goal_distance"]), 2),
+        },
         track_points=env.track.centerline,
         obstacles=env.track.obstacles,
         destination=env.track.destination,
@@ -233,6 +379,45 @@ def run_episode(agent, config: SimulationConfig, learn: bool = True) -> EpisodeS
 def train_agent(agent, config: SimulationConfig, episodes: int = 20) -> List[EpisodeStats]:
     history = []
     for _ in range(episodes):
-        history.append(run_episode(agent, config, learn=True))
+        episode = run_episode(agent, config, learn=True)
+        if hasattr(agent, "adapt_after_episode"):
+            agent.adapt_after_episode(episode)
+        history.append(episode)
     agent.decay()
     return history
+
+
+def train_until_goal(agent, config: SimulationConfig, max_episodes: int = 30) -> List[EpisodeStats]:
+    history = []
+    for _ in range(max_episodes):
+        episode = run_episode(agent, config, learn=True)
+        if hasattr(agent, "adapt_after_episode"):
+            agent.adapt_after_episode(episode)
+        history.append(episode)
+        if episode.get("reached_goal"):
+            break
+    agent.decay()
+    return history
+
+
+def train_coevolution(agent, config: SimulationConfig, episodes: int = 20):
+    history = []
+    current_config = config
+    last_adaptation = None
+
+    for _ in range(episodes):
+        episode = run_episode(agent, current_config, learn=True)
+        if hasattr(agent, "adapt_after_episode"):
+            agent.adapt_after_episode(episode)
+        next_config, adaptation = adapt_config_for_episode(current_config, episode)
+        episode["adaptation"] = adaptation
+        episode["next_config"] = adaptation["next_config"]
+        history.append(episode)
+        last_adaptation = adaptation
+        if episode.get("reached_goal"):
+            current_config = SimulationConfig(**episode["config"])
+            break
+        current_config = next_config
+
+    agent.decay()
+    return history, current_config, last_adaptation

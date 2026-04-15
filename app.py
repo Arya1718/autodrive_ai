@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 
 from adaptive_ai import AdaptiveDirector
 from rl_agent import RLAgent
-from simulation_core import SimulationConfig, run_episode, train_agent
+from simulation_core import SimulationConfig, run_episode, train_agent, train_until_goal, train_coevolution
 from ui_components import inject_theme, render_hero, render_config_summary, render_metrics, render_episode_card
 
 load_dotenv()
@@ -44,6 +44,9 @@ STATE_DEFAULTS = {
     "sensor_text": "Sensor explanation will appear here after a simulation run.",
     "adaptive_text": "Adaptive AI will suggest harder or easier environments here.",
     "last_episode": None,
+    "show_training_video": False,
+    "last_training_block": [],
+    "standard_video_config": None,
     "groq_ready": bool(os.getenv("GROQ_API_KEY")),
 }
 
@@ -67,7 +70,168 @@ def normalize_track_complexity(value: str) -> str:
     return lookup.get(normalized, "moderate")
 
 
-def build_simulation(cfg: dict) -> str:
+def build_simulation(cfg: dict, episode: dict | None = None) -> str:
+        if episode and episode.get("path"):
+            payload = {
+                "track": episode["track_points"],
+                "obstacles": episode["obstacles"],
+                "path": episode["path"],
+                "destination": episode["destination"],
+                "config": episode["config"],
+                "reached_goal": episode.get("reached_goal", False),
+                "collision": episode.get("collision", False),
+            }
+            return f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+    *{{margin:0;padding:0;box-sizing:border-box}}
+    body{{background:#0b0f1a;display:flex;flex-direction:column;align-items:center;justify-content:flex-start;min-height:100vh;padding:10px;overflow:auto}}
+    canvas{{border:2px solid #1e3a5a;border-radius:8px;display:block;max-width:100%;height:auto;aspect-ratio:860/520}}
+    #status{{color:#64748b;font-family:'JetBrains Mono',monospace;font-size:11px;margin-top:6px;text-align:center;width:100%}}
+</style>
+</head>
+<body>
+<canvas id="sim"></canvas>
+<div id="status">⬤ TRAINING REPLAY - EPISODE COMPLETE WHEN DESTINATION IS REACHED</div>
+<script>
+const DATA = {json.dumps(payload)};
+const canvas = document.getElementById('sim');
+const ctx = canvas.getContext('2d');
+const W = 860, H = 520;
+canvas.width = W; canvas.height = H;
+
+const TRACK = DATA.track.map(p => ({{x:p[0], y:p[1]}}));
+const PATH = DATA.path.map(p => ({{x:p[0], y:p[1]}}));
+const OBSTACLES = DATA.obstacles.map(o => ({{x:o[0], y:o[1], r:o[2]}}));
+const DESTINATION = {{x:DATA.destination[0], y:DATA.destination[1]}};
+let frameIndex = 0;
+const maxIndex = Math.max(1, PATH.length - 1);
+let finished = false;
+
+function drawBackground() {{
+    ctx.fillStyle = '#0d1729';
+    ctx.fillRect(0, 0, W, H);
+    ctx.strokeStyle = 'rgba(255,255,255,0.03)';
+    for (let x = 0; x < W; x += 40) {{ ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke(); }}
+    for (let y = 0; y < H; y += 40) {{ ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke(); }}
+}}
+
+function drawRoad() {{
+    ctx.save();
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    ctx.strokeStyle = '#1b2432';
+    ctx.lineWidth = 88;
+    ctx.beginPath();
+    ctx.moveTo(TRACK[0].x, TRACK[0].y);
+    for (let i = 1; i < TRACK.length; i++) ctx.lineTo(TRACK[i].x, TRACK[i].y);
+    ctx.closePath();
+    ctx.stroke();
+    ctx.strokeStyle = '#384557';
+    ctx.lineWidth = 74;
+    ctx.beginPath();
+    ctx.moveTo(TRACK[0].x, TRACK[0].y);
+    for (let i = 1; i < TRACK.length; i++) ctx.lineTo(TRACK[i].x, TRACK[i].y);
+    ctx.closePath();
+    ctx.stroke();
+    ctx.restore();
+}}
+
+function drawObstacles() {{
+    OBSTACLES.forEach((o, i) => {{
+        ctx.fillStyle = i % 2 === 0 ? '#ef4444' : '#f59e0b';
+        ctx.beginPath();
+        ctx.arc(o.x, o.y, o.r, 0, Math.PI * 2);
+        ctx.fill();
+    }});
+}}
+
+function drawDestination() {{
+    const pulse = 8 + Math.sin(Date.now() / 250) * 3;
+    ctx.strokeStyle = 'rgba(16,185,129,.8)';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.arc(DESTINATION.x, DESTINATION.y, 24 + pulse, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.fillStyle = '#22c55e';
+    ctx.beginPath();
+    ctx.arc(DESTINATION.x, DESTINATION.y, 10, 0, Math.PI * 2);
+    ctx.fill();
+}}
+
+function drawTrail(upTo) {{
+    ctx.strokeStyle = 'rgba(56,189,248,.55)';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(PATH[0].x, PATH[0].y);
+    for (let i = 1; i <= upTo; i++) ctx.lineTo(PATH[i].x, PATH[i].y);
+    ctx.stroke();
+}}
+
+function drawCar(i) {{
+    const p = PATH[Math.min(i, PATH.length - 1)];
+    const q = PATH[Math.min(i + 1, PATH.length - 1)];
+    const angle = Math.atan2(q.y - p.y, q.x - p.x);
+    ctx.save();
+    ctx.translate(p.x, p.y);
+    ctx.rotate(angle);
+    ctx.shadowBlur = 16;
+    ctx.shadowColor = 'rgba(14,165,233,.45)';
+    ctx.fillStyle = '#1d4ed8';
+    ctx.beginPath();
+    ctx.roundRect(-16, -10, 32, 20, 7);
+    ctx.fill();
+    ctx.fillStyle = '#dbeafe';
+    ctx.fillRect(-7, -8, 14, 6);
+    ctx.fillStyle = '#111827';
+    ctx.fillRect(-13, -12, 7, 4); ctx.fillRect(6, -12, 7, 4); ctx.fillRect(-13, 8, 7, 4); ctx.fillRect(6, 8, 7, 4);
+    ctx.restore();
+}}
+
+function drawStatus() {{
+    ctx.fillStyle = 'rgba(11,15,26,0.8)';
+    ctx.beginPath();
+    ctx.roundRect(10, 10, 240, 68, 8);
+    ctx.fill();
+    ctx.fillStyle = '#9ec4ee';
+    ctx.font = 'bold 11px JetBrains Mono,monospace';
+    ctx.fillText(DATA.reached_goal ? 'DESTINATION REACHED' : 'TRAINING IN PROGRESS', 20, 30);
+    ctx.fillStyle = '#dbeafe';
+    ctx.font = '10px JetBrains Mono,monospace';
+    ctx.fillText('frames: ' + frameIndex + ' / ' + maxIndex, 20, 48);
+    ctx.fillText(DATA.collision ? 'final episode had a collision' : 'final episode completed safely', 20, 62);
+}}
+
+function frame() {{
+    drawBackground();
+    drawRoad();
+    drawObstacles();
+    drawDestination();
+    drawTrail(frameIndex);
+    drawCar(frameIndex);
+    drawStatus();
+
+    if (!finished) {{
+        if (frameIndex < maxIndex) {{
+            frameIndex += 1;
+            requestAnimationFrame(frame);
+        }} else {{
+            finished = true;
+            document.getElementById('status').textContent = DATA.reached_goal
+                ? '⬤ TRAINING COMPLETE - DESTINATION REACHED'
+                : '⬤ TRAINING COMPLETE - SAFETY CAP HIT';
+        }}
+    }}
+}}
+
+frame();
+</script>
+</body>
+</html>"""
+
+
         cfg_json = json.dumps(cfg)
         return f"""<!DOCTYPE html>
 <html>
@@ -553,7 +717,8 @@ function drawSuccessOverlay(){{
     ctx.restore();
     successAnim-=2;
     if(successAnim<=0){{
-        setTimeout(()=>resetCar(),800);
+        document.getElementById('status').textContent='⬤ DESTINATION REACHED - RESTARTING FROM START';
+        setTimeout(()=>resetCar(),700);
     }}
 }}
 
@@ -587,6 +752,321 @@ loop();
 </script>
 </body>
 </html>"""
+
+
+def build_training_replay(history: list[dict]) -> str:
+    payload = [
+        {
+            "track": episode["track_points"],
+            "obstacles": episode["obstacles"],
+            "path": episode["path"],
+            "destination": episode["destination"],
+            "score": float(episode.get("score", 0.0)),
+            "avg_speed": float(episode.get("avg_speed", 0.0)),
+            "collision": bool(episode.get("collision", False)),
+            "reached_goal": bool(episode.get("reached_goal", False)),
+        }
+        for episode in history
+    ]
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+    *{{margin:0;padding:0;box-sizing:border-box}}
+    body{{background:#0b0f1a;display:flex;flex-direction:column;align-items:center;justify-content:flex-start;min-height:100vh;padding:10px;overflow:auto}}
+    canvas{{border:2px solid #1e3a5a;border-radius:8px;display:block;max-width:100%;height:auto;aspect-ratio:860/520}}
+    #status{{color:#64748b;font-family:'JetBrains Mono',monospace;font-size:11px;margin-top:6px;text-align:center;width:100%}}
+</style>
+</head>
+<body>
+<canvas id="sim"></canvas>
+<div id="status">TRAINING REPLAY RUNNING</div>
+<script>
+const EPISODES = {json.dumps(payload)};
+const canvas = document.getElementById('sim');
+const ctx = canvas.getContext('2d');
+const W = 860, H = 520;
+canvas.width = W;
+canvas.height = H;
+
+let episodeIndex = 0;
+let frameIndex = 0;
+let finished = false;
+let holdFrames = 0;
+let totalScore = 0;
+let totalCrashes = 0;
+let totalGoals = 0;
+let totalEpisodes = 0;
+
+function activeEpisode() {{
+    return EPISODES[Math.min(episodeIndex, EPISODES.length - 1)];
+}}
+
+function drawBackground() {{
+    ctx.fillStyle = '#12261a';
+    ctx.fillRect(0, 0, W, H);
+    ctx.strokeStyle = 'rgba(30,60,35,0.4)';
+    ctx.lineWidth = 1;
+    for (let x = 0; x < W; x += 40) {{
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, H);
+        ctx.stroke();
+    }}
+    for (let y = 0; y < H; y += 40) {{
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(W, y);
+        ctx.stroke();
+    }}
+}}
+
+function drawRoad(track) {{
+    if (!track || track.length < 2) return;
+    ctx.save();
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    ctx.strokeStyle = '#1b2432';
+    ctx.lineWidth = 88;
+    ctx.beginPath();
+    ctx.moveTo(track[0][0], track[0][1]);
+    for (let i = 1; i < track.length; i++) ctx.lineTo(track[i][0], track[i][1]);
+    ctx.closePath();
+    ctx.stroke();
+    ctx.strokeStyle = '#384557';
+    ctx.lineWidth = 74;
+    ctx.beginPath();
+    ctx.moveTo(track[0][0], track[0][1]);
+    for (let i = 1; i < track.length; i++) ctx.lineTo(track[i][0], track[i][1]);
+    ctx.closePath();
+    ctx.stroke();
+    ctx.strokeStyle = 'rgba(255,220,50,0.6)';
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([18, 14]);
+    ctx.beginPath();
+    ctx.moveTo(track[0][0], track[0][1]);
+    for (let i = 1; i < track.length; i++) ctx.lineTo(track[i][0], track[i][1]);
+    ctx.closePath();
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.restore();
+}}
+
+function drawObstacles(obstacles) {{
+    (obstacles || []).forEach((o, i) => {{
+        const x = o[0], y = o[1], r = o[2];
+        ctx.fillStyle = i % 2 === 0 ? '#ef4444' : '#f59e0b';
+        ctx.beginPath();
+        ctx.arc(x, y, r, 0, Math.PI * 2);
+        ctx.fill();
+    }});
+}}
+
+function drawDestination(destination) {{
+    if (!destination) return;
+    const x = destination[0], y = destination[1];
+    const pulse = 8 + Math.sin(Date.now() / 250) * 3;
+    ctx.strokeStyle = 'rgba(16,185,129,.8)';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.arc(x, y, 24 + pulse, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.fillStyle = '#22c55e';
+    ctx.beginPath();
+    ctx.arc(x, y, 10, 0, Math.PI * 2);
+    ctx.fill();
+}}
+
+function drawTrail(path, upTo) {{
+    if (!path || path.length < 2) return;
+    ctx.strokeStyle = 'rgba(56,189,248,.55)';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(path[0][0], path[0][1]);
+    for (let i = 1; i <= upTo; i++) ctx.lineTo(path[i][0], path[i][1]);
+    ctx.stroke();
+}}
+
+function drawCar(path, index) {{
+    if (!path || path.length === 0) return;
+    const p = path[Math.min(index, path.length - 1)];
+    const q = path[Math.min(index + 1, path.length - 1)];
+    const angle = Math.atan2(q[1] - p[1], q[0] - p[0]);
+    ctx.save();
+    ctx.translate(p[0], p[1]);
+    ctx.rotate(angle);
+    ctx.shadowBlur = 16;
+    ctx.shadowColor = 'rgba(14,165,233,.45)';
+    ctx.fillStyle = '#1d4ed8';
+    ctx.beginPath();
+    ctx.roundRect(-16, -10, 32, 20, 7);
+    ctx.fill();
+    ctx.fillStyle = '#dbeafe';
+    ctx.fillRect(-7, -8, 14, 6);
+    ctx.fillStyle = '#111827';
+    ctx.fillRect(-13, -12, 7, 4); ctx.fillRect(6, -12, 7, 4); ctx.fillRect(-13, 8, 7, 4); ctx.fillRect(6, 8, 7, 4);
+    ctx.restore();
+}}
+
+function drawHud(path, destination) {{
+    const p = path[Math.min(frameIndex, path.length - 1)] || [0, 0];
+    const q = path[Math.min(frameIndex + 1, path.length - 1)] || p;
+    const speed = Math.hypot(q[0] - p[0], q[1] - p[1]);
+    const speedKmh = Math.round(speed * 8.5);
+    const distToGoal = destination ? Math.round(Math.hypot(destination[0] - p[0], destination[1] - p[1])) : 0;
+
+    ctx.fillStyle = 'rgba(11,15,26,0.82)';
+    ctx.beginPath();
+    ctx.roundRect(8, 8, 208, 126, 6);
+    ctx.fill();
+    ctx.strokeStyle = '#1e3a5a';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.roundRect(8, 8, 208, 126, 6);
+    ctx.stroke();
+
+    ctx.font = 'bold 11px JetBrains Mono,monospace';
+    ctx.textAlign = 'left';
+    const rows = [
+        ['SPEED', speedKmh + ' km/h', '#38bdf8'],
+        ['SCORE', totalScore.toFixed(2), '#4ade80'],
+        ['CRASHES', totalCrashes, '#f87171'],
+        ['GOALS', totalGoals, '#34d399'],
+        ['EPISODES', totalEpisodes + ' / ' + EPISODES.length, '#fbbf24'],
+        ['DIST TO GOAL', distToGoal + ' px', '#c084fc'],
+    ];
+
+    rows.forEach(([label, val, color], i) => {{
+        const y = 24 + i * 18;
+        ctx.fillStyle = '#475569';
+        ctx.fillText(label, 18, y);
+        ctx.fillStyle = color;
+        ctx.textAlign = 'right';
+        ctx.fillText(String(val), 205, y);
+        ctx.textAlign = 'left';
+    }});
+
+    ctx.fillStyle = 'rgba(11,15,26,0.82)';
+    ctx.beginPath();
+    ctx.roundRect(W - 245, 8, 237, 24, 4);
+    ctx.fill();
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = '10px JetBrains Mono,monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(('RL TRAINING EPISODE ' + (episodeIndex + 1)).toUpperCase(), W - 127, 24);
+    ctx.textAlign = 'left';
+}}
+
+function drawEpisodeOutcome(currentEpisode) {{
+    if (holdFrames <= 0) return;
+    const success = currentEpisode.reached_goal;
+    const fail = !success && currentEpisode.collision;
+    const text = success ? 'DESTINATION REACHED!' : (fail ? 'COLLISION DETECTED' : 'EPISODE COMPLETE');
+    const color = success ? 'rgba(74,222,128,0.72)' : 'rgba(239,68,68,0.72)';
+    ctx.save();
+    ctx.fillStyle = color;
+    ctx.font = 'bold 32px JetBrains Mono,monospace';
+    ctx.textAlign = 'center';
+    ctx.shadowBlur = 20;
+    ctx.shadowColor = color;
+    ctx.fillText(text, W / 2, H / 2);
+    ctx.restore();
+}}
+
+function finalizeEpisode(currentEpisode) {{
+    totalEpisodes += 1;
+    totalScore += currentEpisode.score;
+    if (currentEpisode.collision) totalCrashes += 1;
+    if (currentEpisode.reached_goal) totalGoals += 1;
+    holdFrames = 36;
+}}
+
+function loop() {{
+    const currentEpisode = activeEpisode();
+    const path = currentEpisode.path || [];
+    const maxIndex = Math.max(1, path.length - 1);
+
+    drawBackground();
+    drawRoad(currentEpisode.track);
+    drawTrail(path, frameIndex);
+    drawDestination(currentEpisode.destination);
+    drawObstacles(currentEpisode.obstacles);
+    drawCar(path, frameIndex);
+    drawHud(path, currentEpisode.destination);
+    drawEpisodeOutcome(currentEpisode);
+
+    if (finished) return;
+
+    if (holdFrames > 0) {{
+        holdFrames -= 1;
+        requestAnimationFrame(loop);
+        return;
+    }}
+
+    if (frameIndex < maxIndex) {{
+        frameIndex += 1;
+        requestAnimationFrame(loop);
+        return;
+    }}
+
+    if (totalEpisodes <= episodeIndex) finalizeEpisode(currentEpisode);
+
+    if (currentEpisode.reached_goal || episodeIndex >= EPISODES.length - 1) {{
+        finished = true;
+        document.getElementById('status').textContent = currentEpisode.reached_goal
+            ? 'RL TRAINING COMPLETE - DESTINATION REACHED'
+            : 'RL TRAINING COMPLETE - COLLAPSED BEFORE DESTINATION';
+        return;
+    }}
+
+    if (holdFrames === 0) {{
+        episodeIndex += 1;
+        frameIndex = 0;
+    }}
+    requestAnimationFrame(loop);
+}}
+
+if (!EPISODES || EPISODES.length === 0) {{
+    document.getElementById('status').textContent = 'NO TRAINING EPISODES TO REPLAY';
+}} else {{
+    loop();
+}}
+</script>
+</body>
+</html>"""
+
+
+def summarize_runs(history: list[dict]) -> dict:
+    if not history:
+        return {
+            "Episodes": 0,
+            "Goals": 0,
+            "Crashes": 0,
+            "Avg Score": 0.0,
+            "Avg Efficiency": 0.0,
+            "Success Rate %": 0.0,
+            "Crash Rate %": 0.0,
+            "Accuracy %": 0.0,
+        }
+    episodes = len(history)
+    goals = sum(1 for x in history if x.get("reached_goal"))
+    crashes = sum(1 for x in history if x.get("collision"))
+    avg_score = round(sum(float(x.get("score", 0.0)) for x in history) / episodes, 2)
+    avg_eff = round(sum(float(x.get("path_efficiency", 0.0)) for x in history) / episodes, 3)
+    success_rate = round((goals / episodes) * 100.0, 2)
+    crash_rate = round((crashes / episodes) * 100.0, 2)
+    accuracy = round(max(0.0, success_rate - (0.45 * crash_rate)), 2)
+    return {
+        "Episodes": episodes,
+        "Goals": goals,
+        "Crashes": crashes,
+        "Avg Score": avg_score,
+        "Avg Efficiency": avg_eff,
+        "Success Rate %": success_rate,
+        "Crash Rate %": crash_rate,
+        "Accuracy %": accuracy,
+    }
 
 adaptive_director = AdaptiveDirector()
 
@@ -632,10 +1112,13 @@ with tab_standard:
         run_eval = col_b.button("Evaluate Current Agent", width="stretch")
 
         if run_train:
-            history = train_agent(st.session_state.agent, cfg, episodes=30)
+            history = train_until_goal(st.session_state.agent, cfg, max_episodes=30)
             st.session_state.history_standard.extend(history)
+            st.session_state.last_training_block = history
             latest = history[-1]
             st.session_state.last_episode = latest
+            st.session_state.show_training_video = True
+            st.session_state.standard_video_config = dict(st.session_state.config)
             st.session_state.sensor_text = adaptive_director.explain_sensor_state(latest["sensor_snapshot"], latest["avg_speed"])
             if latest["collision"]:
                 st.session_state.failure_text = adaptive_director.analyze_failure(latest)
@@ -645,18 +1128,33 @@ with tab_standard:
         if run_eval:
             episode = run_episode(st.session_state.agent, cfg, learn=False)
             st.session_state.history_standard.append(episode)
+            st.session_state.last_training_block = []
             st.session_state.last_episode = episode
+            st.session_state.show_training_video = False
             st.session_state.sensor_text = adaptive_director.explain_sensor_state(episode["sensor_snapshot"], episode["avg_speed"])
             if episode["collision"]:
                 st.session_state.failure_text = adaptive_director.analyze_failure(episode)
             st.session_state.analysis_text = adaptive_director.summarize_training_block([episode], adaptive=False)
             st.rerun()
 
-        sim_html = build_simulation(st.session_state.config)
-        st.components.v1.html(sim_html, height=620, scrolling=False)
+        if st.session_state.show_training_video and st.session_state.last_training_block:
+            # Use the exact same animation engine as Adaptive Co-Evolution.
+            video_cfg = st.session_state.standard_video_config or st.session_state.config
+            sim_html = build_simulation(video_cfg)
+            st.components.v1.html(sim_html, height=620, scrolling=False)
+            final_episode = st.session_state.last_training_block[-1]
+            if final_episode.get("reached_goal"):
+                st.success("RL training finished: destination reached.")
+            else:
+                st.error("RL training finished: collapsed before destination.")
+        else:
+            st.info("Run RL training to generate the training replay. The video will only appear after the training loop finishes.")
 
     with right:
-        std_df = pd.DataFrame(st.session_state.history_standard)
+        if st.session_state.show_training_video and st.session_state.last_training_block:
+            std_df = pd.DataFrame(st.session_state.last_training_block)
+        else:
+            std_df = pd.DataFrame(st.session_state.history_standard)
         render_metrics(std_df)
         st.markdown("### 🤖 AI Insights")
         st.info(st.session_state.analysis_text)
@@ -681,18 +1179,15 @@ with tab_adaptive:
         evolve = st.button("Run Adaptive Loop", width="stretch")
 
         if evolve:
-            local_cfg = cfg
-            block = []
-            for _ in range(12):
-                history = train_agent(st.session_state.agent, local_cfg, episodes=3)
-                latest = history[-1]
-                block.extend(history)
-                proposal = adaptive_director.propose_adaptation(local_cfg, latest)
-                proposal["config"]["track_complexity"] = normalize_track_complexity(
-                    proposal["config"].get("track_complexity", "moderate")
-                )
-                local_cfg = SimulationConfig(**proposal["config"])
-                st.session_state.adaptive_text = proposal["analysis"]
+            block, local_cfg, last_adaptation = train_coevolution(st.session_state.agent, cfg, episodes=12)
+            for episode in block:
+                if episode.get("adaptation"):
+                    st.session_state.adaptive_text = episode["adaptation"]["analysis"]
+                st.session_state.sensor_text = adaptive_director.explain_sensor_state(episode["sensor_snapshot"], episode["avg_speed"])
+                if episode["collision"]:
+                    st.session_state.failure_text = adaptive_director.analyze_failure(episode)
+                if episode.get("reached_goal"):
+                    break
             st.session_state.config = asdict(local_cfg)
             st.session_state.history_adaptive.extend(block)
             st.session_state.last_episode = block[-1]
@@ -700,6 +1195,8 @@ with tab_adaptive:
             if block[-1]["collision"]:
                 st.session_state.failure_text = adaptive_director.analyze_failure(block[-1])
             st.session_state.sensor_text = adaptive_director.explain_sensor_state(block[-1]["sensor_snapshot"], block[-1]["avg_speed"])
+            if last_adaptation:
+                st.session_state.adaptive_text = last_adaptation["analysis"]
             st.rerun()
 
         sim_html = build_simulation(st.session_state.config)
@@ -720,3 +1217,25 @@ with tab_adaptive:
             fig2.update_layout(height=300, margin=dict(l=20, r=20, t=20, b=20))
             st.plotly_chart(fig2, width="stretch")
             render_episode_card(adf.iloc[-1].to_dict())
+
+st.markdown("## Standard vs Adaptive Comparison")
+std_compare = summarize_runs(st.session_state.history_standard)
+adp_compare = summarize_runs(st.session_state.history_adaptive)
+comparison_df = pd.DataFrame(
+    [
+        {"Mode": "Standard RL", **std_compare},
+        {"Mode": "Adaptive Co-Evolution", **adp_compare},
+    ]
+)
+st.dataframe(comparison_df, width="stretch")
+
+if comparison_df["Episodes"].sum() > 0:
+    metric_fig = px.bar(
+        comparison_df,
+        x="Mode",
+        y=["Accuracy %", "Success Rate %", "Crash Rate %"],
+        barmode="group",
+        template="plotly_dark",
+    )
+    metric_fig.update_layout(height=320, margin=dict(l=20, r=20, t=20, b=20))
+    st.plotly_chart(metric_fig, width="stretch")
