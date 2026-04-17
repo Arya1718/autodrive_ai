@@ -36,7 +36,8 @@ DEFAULT_CONFIG = {
 
 STATE_DEFAULTS = {
     "config": DEFAULT_CONFIG.copy(),
-    "agent": RLAgent(),
+    "agent_standard": RLAgent(),
+    "agent_adaptive": RLAgent(),
     "history_standard": [],
     "history_adaptive": [],
     "analysis_text": "AI analysis will appear here after you run training or adaptive co-evolution.",
@@ -50,6 +51,10 @@ STATE_DEFAULTS = {
     "groq_ready": bool(os.getenv("GROQ_API_KEY")),
     "benchmark_df": pd.DataFrame(),
     "benchmark_overall": pd.DataFrame(),
+    "env_reasoning": "",
+    "curriculum_plan": None,
+    "llm_episode_logs": [],
+    "reward_shaping_log": [],
 }
 
 for key, value in STATE_DEFAULTS.items():
@@ -1044,27 +1049,36 @@ def summarize_runs(history: list[dict]) -> dict:
         return {
             "Episodes": 0,
             "Goals": 0,
+            "Safe Goals": 0,
             "Crashes": 0,
+            "Crash Events": 0,
             "Avg Score": 0.0,
             "Avg Efficiency": 0.0,
+            "Goal Reach %": 0.0,
             "Success Rate %": 0.0,
             "Crash Rate %": 0.0,
             "Accuracy %": 0.0,
         }
     episodes = len(history)
     goals = sum(1 for x in history if x.get("reached_goal"))
+    safe_goals = sum(1 for x in history if x.get("reached_goal") and not x.get("collision"))
     crashes = sum(1 for x in history if x.get("collision"))
+    crash_events = sum(int(x.get("collision_count", 1 if x.get("collision") else 0)) for x in history)
     avg_score = round(sum(float(x.get("score", 0.0)) for x in history) / episodes, 2)
     avg_eff = round(sum(float(x.get("path_efficiency", 0.0)) for x in history) / episodes, 3)
-    success_rate = round((goals / episodes) * 100.0, 2)
+    goal_rate = round((goals / episodes) * 100.0, 2)
+    success_rate = round((safe_goals / episodes) * 100.0, 2)
     crash_rate = round((crashes / episodes) * 100.0, 2)
     accuracy = round(max(0.0, success_rate - (0.45 * crash_rate)), 2)
     return {
         "Episodes": episodes,
         "Goals": goals,
+        "Safe Goals": safe_goals,
         "Crashes": crashes,
+        "Crash Events": crash_events,
         "Avg Score": avg_score,
         "Avg Efficiency": avg_eff,
+        "Goal Reach %": goal_rate,
         "Success Rate %": success_rate,
         "Crash Rate %": crash_rate,
         "Accuracy %": accuracy,
@@ -1188,6 +1202,9 @@ def run_benchmark_suite(agent, base_cfg: SimulationConfig, episodes_per_scenario
 
 adaptive_director = AdaptiveDirector()
 
+# ─────────────────────────────────────────────────────────────────────────────
+# SIDEBAR — LLM-Driven Environment Generation
+# ─────────────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## Control Center")
     st.session_state.config["track_complexity"] = normalize_track_complexity(
@@ -1203,45 +1220,62 @@ with st.sidebar:
     obstacles = st.slider("Obstacles", 2, 18, int(st.session_state.config["obstacle_count"]))
     speed = st.slider("Car speed", 1.0, 4.5, float(st.session_state.config["car_speed"]), 0.1)
 
-    if st.button("Generate Environment", width="stretch"):
-        generated = adaptive_director.generate_environment(prompt)
+    if st.button("🧠 Generate Environment (LLM)", width="stretch"):
+        with st.spinner("LLM designing environment..."):
+            generated, reasoning = adaptive_director.generate_environment(prompt)
         generated["weather"] = weather
         generated["track_complexity"] = normalize_track_complexity(complexity)
         generated["obstacle_count"] = obstacles
         generated["car_speed"] = speed
         st.session_state.config = generated
-        st.session_state.adaptive_text = f"Environment generated: {generated['environment_name']} | {generated['description']}"
+        st.session_state.env_reasoning = reasoning
+        st.session_state.adaptive_text = f"**LLM Environment:** {generated['environment_name']} — {generated['description']}"
         st.rerun()
+
+    # Show LLM reasoning for environment generation
+    if st.session_state.env_reasoning:
+        with st.expander("🧠 LLM Design Reasoning", expanded=False):
+            st.markdown(st.session_state.env_reasoning)
+
+    st.markdown("---")
+    st.caption("🤖 **LLM Integration Level**: The Groq LLM powers environment generation, curriculum planning, per-episode adaptation, reward shaping, and action guidance during Adaptive Co-Evolution.")
 
 st.session_state.config["track_complexity"] = normalize_track_complexity(
     st.session_state.config.get("track_complexity", "moderate")
 )
 cfg = SimulationConfig(**st.session_state.config)
 
-tab_standard, tab_adaptive = st.tabs(["Standard RL Training", "Adaptive Co-Evolution"])
+tab_standard, tab_adaptive = st.tabs(["Standard RL Training", "Adaptive Co-Evolution (LLM-Driven)"])
 
+# ─────────────────────────────────────────────────────────────────────────────
+# TAB 1 — Standard RL Training (No LLM during training, LLM post-hoc only)
+# ─────────────────────────────────────────────────────────────────────────────
 with tab_standard:
     left, right = st.columns([1.1, 0.9], gap="large")
 
     with left:
         render_config_summary(cfg, adaptive=False)
+        st.caption("⚡ Standard mode: Fixed environment, no LLM guidance during training. LLM only provides post-hoc analysis.")
         col_a, col_b = st.columns(2)
         run_train = col_a.button("Run RL Training", width="stretch")
         run_eval = col_b.button("Evaluate Current Agent", width="stretch")
 
         if run_train:
+            # Fair baseline: each run starts from a fresh standard agent and clean history.
+            st.session_state.agent_standard = RLAgent()
+            st.session_state.history_standard = []
             progress_container = st.container()
             table_placeholder = progress_container.empty()
             message_placeholder = progress_container.empty()
             
             with message_placeholder.container():
-                st.info("🔄 Training in progress... Updating after each episode.")
+                st.info("🔄 Training in progress... Running 20 episodes.")
             
             history = []
-            for episode_num in range(1, 31):
-                episode = run_episode(st.session_state.agent, cfg, learn=True)
-                if hasattr(st.session_state.agent, "adapt_after_episode"):
-                    st.session_state.agent.adapt_after_episode(episode)
+            for episode_num in range(1, 21):
+                episode = run_episode(st.session_state.agent_standard, cfg, learn=True)
+                if hasattr(st.session_state.agent_standard, "adapt_after_episode"):
+                    st.session_state.agent_standard.adapt_after_episode(episode)
                 history.append(episode)
                 st.session_state.history_standard.append(episode)
                 
@@ -1251,12 +1285,8 @@ with tab_standard:
                 display_cols = ["episode_index", "score", "collision", "reached_goal", "path_efficiency", "avg_speed"]
                 with table_placeholder.container():
                     st.dataframe(history_df[display_cols], width="stretch")
-                
-                if episode.get("reached_goal"):
-                    st.session_state.agent.decay()
-                    break
-            else:
-                st.session_state.agent.decay()
+
+            st.session_state.agent_standard.decay()
             
             st.session_state.last_training_block = history
             latest = history[-1]
@@ -1268,16 +1298,18 @@ with tab_standard:
                 st.session_state.failure_text = adaptive_director.analyze_failure(latest)
             st.session_state.analysis_text = adaptive_director.summarize_training_block(history, adaptive=False)
             
+            goals_total = sum(1 for e in history if e.get("reached_goal"))
+            crashes_total = sum(1 for e in history if e.get("collision"))
             with message_placeholder.container():
-                if latest.get("reached_goal"):
-                    st.success("✅ RL training finished: destination reached!")
+                if goals_total > 0:
+                    st.success(f"✅ RL training complete: {goals_total} goals, {crashes_total} crashes across {len(history)} episodes.")
                 else:
-                    st.error("❌ RL training finished: max episodes reached without destination.")
+                    st.error(f"❌ RL training complete: 0 goals reached in {len(history)} episodes.")
             
             st.rerun()
 
         if run_eval:
-            episode = run_episode(st.session_state.agent, cfg, learn=False)
+            episode = run_episode(st.session_state.agent_standard, cfg, learn=False)
             st.session_state.history_standard.append(episode)
             st.session_state.last_training_block = []
             st.session_state.last_episode = episode
@@ -1322,81 +1354,226 @@ with tab_standard:
             st.plotly_chart(fig, width="stretch")
             st.dataframe(chart_df[["episode_index", "score", "collision", "reached_goal", "path_efficiency", "avg_speed"]].tail(10), width="stretch")
 
+# ─────────────────────────────────────────────────────────────────────────────
+# TAB 2 — Adaptive Co-Evolution (Full LLM Integration)
+# ─────────────────────────────────────────────────────────────────────────────
 with tab_adaptive:
     left2, right2 = st.columns([1.1, 0.9], gap="large")
 
     with left2:
         render_config_summary(cfg, adaptive=True)
-        evolve = st.button("Run Adaptive Loop", width="stretch")
+        st.caption("🧠 **LLM-Driven Mode**: Curriculum planning → Per-episode LLM adaptation → Dynamic reward shaping → Action guidance hints")
+        evolve = st.button("🧠 Run Adaptive Loop (LLM-Driven)", width="stretch")
 
         if evolve:
+            # Fair comparison: adaptive run starts from a fresh adaptive agent and clean history.
+            st.session_state.agent_adaptive = RLAgent()
+            st.session_state.history_adaptive = []
             progress_container = st.container()
+            curriculum_placeholder = progress_container.empty()
             table_placeholder = progress_container.empty()
+            llm_log_placeholder = progress_container.empty()
             message_placeholder = progress_container.empty()
             
+            # ── Phase 0: LLM generates curriculum plan ──
             with message_placeholder.container():
-                st.info("🔄 Adaptive training in progress... Updating after each episode.")
+                st.info("🧠 LLM generating curriculum plan...")
+            
+            curriculum = adaptive_director.generate_curriculum_plan(cfg, total_episodes=20)
+            st.session_state.curriculum_plan = curriculum
+            
+            with curriculum_placeholder.container():
+                with st.expander("📋 LLM Curriculum Plan", expanded=True):
+                    st.markdown(f"**Strategy:** {curriculum.get('strategy', 'Progressive difficulty scaling')}")
+                    for i, phase in enumerate(curriculum.get("phases", []), 1):
+                        st.markdown(
+                            f"**Phase {i} — {phase.get('phase_name', f'Phase {i}')}** "
+                            f"({phase.get('episodes', 5)} episodes) | "
+                            f"Obstacles: {phase.get('obstacle_count', 5)} | "
+                            f"Speed: {phase.get('car_speed', 2.0)} | "
+                            f"Track: {phase.get('track_complexity', 'simple')} | "
+                            f"Weather: {phase.get('weather', 'clear')}"
+                        )
+                        st.caption(f"🎯 Goal: {phase.get('goal', '')} | Reward Focus: {phase.get('reward_focus', 'progress')}")
+
+            with message_placeholder.container():
+                st.info("🔄 Adaptive training in progress with LLM guidance...")
             
             block = []
+            llm_logs = []
             current_config = cfg
             last_adaptation = None
+            current_reward_mods = None
+            current_action_hints = None
+            total_adaptive_episodes = 0
 
-            for episode_num in range(1, 13):
-                prev_episode = block[-1] if block else None
-                episode = run_episode(st.session_state.agent, current_config, learn=True)
-                episode["prev_score"] = round(float(prev_episode.get("score", 0.0)), 2) if prev_episode else None
-                episode["prev_path_efficiency"] = round(float(prev_episode.get("path_efficiency", 0.0)), 3) if prev_episode else None
-                episode["prev_avg_speed"] = round(float(prev_episode.get("avg_speed", 0.0)), 2) if prev_episode else None
-                episode["prev_collision"] = bool(prev_episode.get("collision", False)) if prev_episode else None
-                episode["prev_reached_goal"] = bool(prev_episode.get("reached_goal", False)) if prev_episode else None
-                episode["prev_sensor_snapshot"] = prev_episode.get("sensor_snapshot") if prev_episode else None
-                if hasattr(st.session_state.agent, "adapt_after_episode"):
-                    st.session_state.agent.adapt_after_episode(episode)
-                next_config, adaptation = adapt_config_for_episode(current_config, episode)
-                episode["adaptation"] = adaptation
-                episode["next_config"] = adaptation["next_config"]
-                block.append(episode)
-                st.session_state.history_adaptive.append(episode)
-                last_adaptation = adaptation
+            # ── Execute curriculum phases ──
+            phases = curriculum.get("phases", [])
+            complexity_order = ["simple", "moderate", "complex"]
+            for phase_idx, phase in enumerate(phases):
+                phase_episodes = int(phase.get("episodes", 5))
+                phase_config_dict = asdict(current_config)
+                phase_reward_focus = str(phase.get("reward_focus", "progress")).strip().lower()
+                target_phase_complexity = normalize_track_complexity(phase.get("track_complexity", "moderate"))
+                target_complexity_index = complexity_order.index(target_phase_complexity)
+
+                # Seed reward shaping per phase so adaptive training has stable intent before first LLM update.
+                reward_focus_defaults = {
+                    "survival": {"goal_bonus": 18.0, "progress_bonus": 2.0, "speed_bonus": 0.2, "survival_bonus": 2.2, "smooth_steering_bonus": 1.0},
+                    "progress": {"goal_bonus": 20.0, "progress_bonus": 3.0, "speed_bonus": 0.5, "survival_bonus": 1.2, "smooth_steering_bonus": 0.7},
+                    "efficiency": {"goal_bonus": 12.0, "progress_bonus": 2.0, "speed_bonus": 0.9, "survival_bonus": 0.8, "smooth_steering_bonus": 1.2},
+                    "speed": {"goal_bonus": 10.0, "progress_bonus": 1.5, "speed_bonus": 1.2, "survival_bonus": 0.5, "smooth_steering_bonus": 0.6},
+                }
+                current_reward_mods = reward_focus_defaults.get(phase_reward_focus, reward_focus_defaults["progress"]).copy()
+                current_action_hints = {"prefer_cautious": phase_reward_focus == "survival", "prefer_aggressive": phase_reward_focus == "speed"}
                 
-                # Update adaptive-specific table after each episode
-                block_df = pd.DataFrame(block)
-                block_df["episode_index"] = range(1, len(block_df) + 1)
-                display_cols = [
-                    "episode_index",
-                    "score",
-                    "collision",
-                    "reached_goal",
-                    "path_efficiency",
-                    "difficulty",
-                    "prev_score",
-                    "prev_path_efficiency",
-                    "prev_avg_speed",
-                    "prev_collision",
-                    "prev_reached_goal",
-                    "prev_sensor_snapshot",
-                ]
-                with table_placeholder.container():
-                    st.dataframe(block_df[display_cols], width="stretch")
-                
-                # Update adaptive text with current adaptation analysis
-                if episode.get("adaptation"):
-                    st.session_state.adaptive_text = episode["adaptation"]["analysis"]
-                st.session_state.sensor_text = adaptive_director.explain_sensor_state(episode["sensor_snapshot"], episode["avg_speed"])
-                if episode["collision"]:
-                    st.session_state.failure_text = adaptive_director.analyze_failure(episode)
-                
-                if episode.get("reached_goal"):
-                    current_config = SimulationConfig(**episode["config"])
-                    st.session_state.agent.decay()
-                    break
-                
-                current_config = next_config
-            else:
-                st.session_state.agent.decay()
+                # Apply phase config from curriculum (start easy, ramp up)
+                phase_config_dict["obstacle_count"] = int(phase.get("obstacle_count", phase_config_dict["obstacle_count"]))
+                phase_config_dict["car_speed"] = float(phase.get("car_speed", phase_config_dict["car_speed"]))
+                phase_config_dict["track_complexity"] = normalize_track_complexity(
+                    phase.get("track_complexity", phase_config_dict["track_complexity"])
+                )
+                phase_config_dict["weather"] = phase.get("weather", phase_config_dict["weather"])
+                phase_config_dict["fog_alpha"] = float(phase.get("fog_alpha", phase_config_dict.get("fog_alpha", 0.0)))
+                phase_config = SimulationConfig(**phase_config_dict)
+                current_config = phase_config
+
+                for ep_in_phase in range(phase_episodes):
+                    total_adaptive_episodes += 1
+                    prev_episode = block[-1] if block else None
+
+                    # Run episode with LLM reward shaping and action hints
+                    episode = run_episode(
+                        st.session_state.agent_adaptive,
+                        current_config,
+                        learn=True,
+                        reward_modifiers=current_reward_mods,
+                        action_hints=current_action_hints,
+                    )
+
+                    # Attach previous episode context
+                    episode["prev_score"] = round(float(prev_episode.get("score", 0.0)), 2) if prev_episode else None
+                    episode["prev_path_efficiency"] = round(float(prev_episode.get("path_efficiency", 0.0)), 3) if prev_episode else None
+                    episode["prev_avg_speed"] = round(float(prev_episode.get("avg_speed", 0.0)), 2) if prev_episode else None
+                    episode["prev_collision"] = bool(prev_episode.get("collision", False)) if prev_episode else None
+                    episode["prev_reached_goal"] = bool(prev_episode.get("reached_goal", False)) if prev_episode else None
+                    episode["prev_sensor_snapshot"] = prev_episode.get("sensor_snapshot") if prev_episode else None
+                    episode["phase"] = phase.get("phase_name", f"Phase {phase_idx + 1}")
+                    episode["llm_reward_shaped"] = current_reward_mods is not None
+                    episode["llm_action_guided"] = current_action_hints is not None
+
+                    if hasattr(st.session_state.agent_adaptive, "adapt_after_episode"):
+                        st.session_state.agent_adaptive.adapt_after_episode(episode)
+
+                    # ── LLM evaluates episode and adapts ──
+                    llm_result = adaptive_director.evaluate_episode_and_adapt(
+                        current_config, episode, block, phase_info=phase
+                    )
+                    
+                    episode["adaptation"] = {
+                        "analysis": llm_result.get("analysis", ""),
+                        "next_config": llm_result.get("config", asdict(current_config)),
+                    }
+                    episode["next_config"] = llm_result.get("config", asdict(current_config))
+                    
+                    # Extract LLM reward modifiers and action hints for next episode
+                    llm_reward_mods = llm_result.get("reward_modifiers") or {}
+                    llm_action_hints = llm_result.get("action_hints") or {}
+
+                    # Blend LLM reward shaping with phase defaults to avoid unstable jumps.
+                    blended_reward_mods = {}
+                    for key, base_value in reward_focus_defaults.get(phase_reward_focus, reward_focus_defaults["progress"]).items():
+                        llm_value = float(llm_reward_mods.get(key, base_value))
+                        blended_reward_mods[key] = round((0.6 * llm_value) + (0.4 * float(base_value)), 3)
+
+                    current_reward_mods = blended_reward_mods
+                    current_action_hints = {
+                        "prefer_cautious": bool(llm_action_hints.get("prefer_cautious", False)) or phase_reward_focus == "survival",
+                        "prefer_aggressive": bool(llm_action_hints.get("prefer_aggressive", False)) and phase_reward_focus in ("progress", "speed", "efficiency"),
+                    }
+                    
+                    llm_log_entry = {
+                        "episode": total_adaptive_episodes,
+                        "phase": phase.get("phase_name", ""),
+                        "analysis": llm_result.get("analysis", ""),
+                        "reward_mods": current_reward_mods,
+                        "action_hints": current_action_hints,
+                        "score": round(float(episode.get("score", 0)), 2),
+                        "collision": episode.get("collision", False),
+                        "reached_goal": episode.get("reached_goal", False),
+                    }
+                    llm_logs.append(llm_log_entry)
+                    
+                    block.append(episode)
+                    st.session_state.history_adaptive.append(episode)
+                    last_adaptation = episode["adaptation"]
+                    
+                    # Update display
+                    block_df = pd.DataFrame(block)
+                    block_df["episode_index"] = range(1, len(block_df) + 1)
+                    display_cols = [
+                        "episode_index", "phase", "score", "collision", "reached_goal",
+                        "path_efficiency", "difficulty", "llm_reward_shaped", "llm_action_guided",
+                    ]
+                    available_cols = [c for c in display_cols if c in block_df.columns]
+                    with table_placeholder.container():
+                        st.dataframe(block_df[available_cols], width="stretch")
+                    
+                    with llm_log_placeholder.container():
+                        with st.expander(f"🧠 LLM Adaptation Log (Episode {total_adaptive_episodes})", expanded=False):
+                            st.markdown(f"**Phase:** {llm_log_entry['phase']}")
+                            st.markdown(f"**LLM Analysis:** {llm_log_entry['analysis']}")
+                            if current_reward_mods:
+                                st.json(current_reward_mods)
+                    
+                    # Update adaptive text
+                    st.session_state.adaptive_text = llm_result.get("analysis", "")
+                    st.session_state.sensor_text = adaptive_director.explain_sensor_state(episode["sensor_snapshot"], episode["avg_speed"])
+                    if episode["collision"]:
+                        st.session_state.failure_text = adaptive_director.analyze_failure(episode)
+                    
+                    # Apply LLM-adapted config for next episode within this phase
+                    adapted_cfg_dict = llm_result.get("config", asdict(current_config))
+                    adapted_cfg_dict["track_complexity"] = normalize_track_complexity(
+                        adapted_cfg_dict.get("track_complexity", "moderate")
+                    )
+
+                    # Phase guardrails: keep adaptation near current phase target to prevent abrupt over-hardening.
+                    adapted_cfg_dict["obstacle_count"] = int(max(2, min(18, adapted_cfg_dict.get("obstacle_count", phase_config.obstacle_count))))
+                    adapted_cfg_dict["car_speed"] = float(max(1.0, min(4.5, adapted_cfg_dict.get("car_speed", phase_config.car_speed))))
+
+                    max_obstacles_for_phase = min(18, int(phase_config.obstacle_count) + 1)
+                    min_obstacles_for_phase = max(2, int(phase_config.obstacle_count) - 2)
+                    adapted_cfg_dict["obstacle_count"] = int(max(min_obstacles_for_phase, min(max_obstacles_for_phase, adapted_cfg_dict["obstacle_count"])))
+
+                    max_speed_for_phase = min(4.5, float(phase_config.car_speed) + 0.2)
+                    min_speed_for_phase = max(1.0, float(phase_config.car_speed) - 0.35)
+                    adapted_cfg_dict["car_speed"] = float(max(min_speed_for_phase, min(max_speed_for_phase, adapted_cfg_dict["car_speed"])))
+
+                    # Do not exceed planned complexity within a phase.
+                    adapted_complexity = normalize_track_complexity(adapted_cfg_dict.get("track_complexity", target_phase_complexity))
+                    adapted_index = complexity_order.index(adapted_complexity)
+                    if adapted_index > target_complexity_index:
+                        adapted_cfg_dict["track_complexity"] = target_phase_complexity
+
+                    # Safety recovery: if recent crashes spike, temporarily reduce pressure.
+                    recent_phase = block[-3:] if len(block) >= 3 else block
+                    recent_crashes = sum(1 for ep in recent_phase if ep.get("collision"))
+                    if recent_crashes >= 2:
+                        adapted_cfg_dict["obstacle_count"] = max(2, int(adapted_cfg_dict["obstacle_count"]) - 2)
+                        adapted_cfg_dict["car_speed"] = max(1.0, round(float(adapted_cfg_dict["car_speed"]) - 0.25, 2))
+                        adapted_cfg_dict["weather"] = "clear"
+                        adapted_cfg_dict["fog_alpha"] = 0.0
+                        current_reward_mods["survival_bonus"] = max(current_reward_mods.get("survival_bonus", 0.0), 2.2)
+                        current_reward_mods["speed_bonus"] = min(current_reward_mods.get("speed_bonus", 0.0), 0.5)
+                        current_action_hints["prefer_cautious"] = True
+
+                    current_config = SimulationConfig(**adapted_cfg_dict)
+                st.session_state.agent_adaptive.decay()
             
             st.session_state.config = asdict(current_config)
             st.session_state.last_episode = block[-1]
+            st.session_state.llm_episode_logs = llm_logs
             st.session_state.analysis_text = adaptive_director.summarize_training_block(block, adaptive=True)
             if block[-1].get("collision") and not block[-1].get("reached_goal"):
                 st.session_state.failure_text = adaptive_director.analyze_failure(block[-1])
@@ -1405,10 +1582,13 @@ with tab_adaptive:
                 st.session_state.adaptive_text = last_adaptation["analysis"]
             
             with message_placeholder.container():
-                if block[-1].get("reached_goal"):
-                    st.success("✅ Adaptive training finished: destination reached!")
+                goals_reached = sum(1 for e in block if e.get("reached_goal"))
+                crashes_count = sum(1 for e in block if e.get("collision"))
+                safe_goals = sum(1 for e in block if e.get("reached_goal") and not e.get("collision"))
+                if safe_goals > 0:
+                    st.success(f"✅ Adaptive LLM training finished: {safe_goals} safe goals ({goals_reached} total goals), {crashes_count} crashes across {len(block)} episodes")
                 else:
-                    st.error("❌ Adaptive training finished: max episodes reached without destination.")
+                    st.error(f"❌ Adaptive LLM training finished: no crash-free goals yet. ({goals_reached} total goals, {crashes_count} crashes across {len(block)} episodes)")
             
             st.rerun()
 
@@ -1418,10 +1598,35 @@ with tab_adaptive:
     with right2:
         adf = pd.DataFrame(st.session_state.history_adaptive)
         render_metrics(adf)
-        st.markdown("### 🧠 Adaptive Director")
+        
+        # Show curriculum plan if available
+        if st.session_state.curriculum_plan:
+            with st.expander("📋 LLM Curriculum Plan", expanded=False):
+                plan = st.session_state.curriculum_plan
+                st.markdown(f"**Strategy:** {plan.get('strategy', '')}")
+                for i, phase in enumerate(plan.get("phases", []), 1):
+                    st.markdown(
+                        f"**Phase {i} — {phase.get('phase_name', '')}**: "
+                        f"{phase.get('episodes', 0)} eps | "
+                        f"Obs: {phase.get('obstacle_count', 0)} | "
+                        f"Spd: {phase.get('car_speed', 0)} | "
+                        f"Goal: {phase.get('goal', '')}"
+                    )
+        
+        st.markdown("### 🧠 Adaptive Director (LLM)")
         st.info(st.session_state.adaptive_text)
         st.markdown("### 🤖 AI Insights")
         st.success(st.session_state.analysis_text)
+        
+        # Show LLM episode logs
+        if st.session_state.llm_episode_logs:
+            with st.expander("🔍 LLM Episode-by-Episode Decisions", expanded=False):
+                for log in st.session_state.llm_episode_logs[-10:]:
+                    status = "✅" if log["reached_goal"] else ("💥" if log["collision"] else "⏩")
+                    st.markdown(
+                        f"{status} **Ep {log['episode']}** ({log['phase']}) — "
+                        f"Score: {log['score']} — {log['analysis'][:120]}"
+                    )
 
         if not adf.empty:
             adf = adf.copy()
@@ -1429,32 +1634,28 @@ with tab_adaptive:
             fig2 = px.line(adf, x="episode_index", y=["score", "difficulty"], markers=True, template="plotly_dark")
             fig2.update_layout(height=300, margin=dict(l=20, r=20, t=20, b=20))
             st.plotly_chart(fig2, width="stretch")
-            st.markdown("### 📋 Adaptive Episode Log (With Previous Episode Readings)")
+            st.markdown("### 📋 Adaptive Episode Log")
             adaptive_table_cols = [
-                "episode_index",
-                "score",
-                "collision",
-                "reached_goal",
-                "path_efficiency",
-                "difficulty",
-                "prev_score",
-                "prev_path_efficiency",
-                "prev_avg_speed",
-                "prev_collision",
-                "prev_reached_goal",
-                "prev_sensor_snapshot",
+                "episode_index", "phase", "score", "collision", "reached_goal",
+                "path_efficiency", "difficulty", "llm_reward_shaped", "llm_action_guided",
+                "prev_score", "prev_collision", "prev_reached_goal",
             ]
             available_cols = [col for col in adaptive_table_cols if col in adf.columns]
             st.dataframe(adf[available_cols].tail(12), width="stretch")
             render_episode_card(adf.iloc[-1].to_dict())
 
+# ─────────────────────────────────────────────────────────────────────────────
+# COMPARISON SECTION
+# ─────────────────────────────────────────────────────────────────────────────
 st.markdown("## Standard vs Adaptive Comparison")
+st.caption("The Adaptive Co-Evolution mode uses LLM-driven curriculum planning, dynamic reward shaping, and per-episode environment adaptation — giving the agent a structured learning advantage over brute-force Standard RL.")
+
 std_compare = summarize_runs(st.session_state.history_standard)
 adp_compare = summarize_runs(st.session_state.history_adaptive)
 comparison_df = pd.DataFrame(
     [
         {"Mode": "Standard RL", **std_compare},
-        {"Mode": "Adaptive Co-Evolution", **adp_compare},
+        {"Mode": "Adaptive Co-Evolution (LLM)", **adp_compare},
     ]
 )
 st.dataframe(comparison_df, width="stretch")
@@ -1480,7 +1681,7 @@ with bench_col1:
 
     if run_benchmark:
         with st.spinner("Running benchmark scenarios..."):
-            benchmark_df, overall_df = run_benchmark_suite(st.session_state.agent, cfg, episodes_per_scenario=bench_episodes)
+            benchmark_df, overall_df = run_benchmark_suite(st.session_state.agent_standard, cfg, episodes_per_scenario=bench_episodes)
             st.session_state.benchmark_df = benchmark_df
             st.session_state.benchmark_overall = overall_df
 
